@@ -1,0 +1,143 @@
+services:
+  # Zookeeper (обязательный для Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    networks:
+      - ml-scorer
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # Сервис Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    restart: on-failure
+    depends_on:
+      - zookeeper
+    networks:
+      - ml-scorer
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"  # Отключаем автосоздание топиков
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9095", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  # Сервис для создания топиков при старте
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    depends_on:
+      kafka:
+        condition: service_healthy  # Ждем пока Kafka станет здоровой
+    networks:
+      - ml-scorer
+    restart: on-failure
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        echo 'Ожидание готовности Kafka...'
+        until kafka-topics --bootstrap-server kafka:9092 --list; do
+          sleep 1
+        done
+
+        echo 'Создание топиков...'
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
+
+        echo 'Топики успешно созданы:'
+        kafka-topics --bootstrap-server kafka:9092 --list
+  
+  # Сервис для удобного просмотра топиков и настройки kafka
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+    networks:
+      - ml-scorer
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+  fraud_detector:
+    build: ./fraud_detector
+    volumes:
+      - ./data/train.csv:/app/train_data/train.csv:ro
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_TRANSACTIONS_TOPIC: "transactions"
+      KAFKA_SCORING_TOPIC: "scores"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+
+  interface:
+    build: ./interface
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BROKERS: "kafka:9092"  # Используем внутренний адрес Kafka
+      KAFKA_TOPIC: "transactions"
+      DATABASE_URL: "postgresql://fraud:fraud@postgres:5432/fraud_scores"
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fraud_scores
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - ml-scorer
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d fraud_scores"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  scores_writer:
+    build: ./scores_writer
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_SCORES_TOPIC: "scores"
+      DATABASE_URL: "postgresql://fraud:fraud@postgres:5432/fraud_scores"
+    networks:
+      - ml-scorer
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+networks:
+  ml-scorer:
+    name: ml-scorer
+    driver: bridge
+
+volumes:
+  postgres_data:
